@@ -1,6 +1,8 @@
-# TriMul Autoresearch
+# TriMul Autoresearch — Epoch Refresh
 
-An advisor-worker agent pair that iteratively optimizes a CUDA kernel for the Triangle Multiplicative Update (TriMul) operator on NVIDIA H100. Each iteration the **advisor** reviews experiment history and proposes a strategic direction; the **worker** implements exactly one change to `submission.py`, evaluates it on an H100 via Modal, logs the result, and stops. The outer loop drives the next iteration.
+An advisor-worker agent pair that iteratively optimizes a CUDA kernel for the Triangle Multiplicative Update (TriMul) operator on NVIDIA H100. Each iteration the **advisor** reviews experiment history and proposes a strategic direction; the **worker** implements it, evaluates on an H100 via Modal, and logs the result.
+
+After each epoch the run history is committed to git and wiped, and the best kernel from that epoch becomes the baseline for the next — giving the agents a fresh context window to explore without the noise of accumulated dead ends.
 
 ## Task
 
@@ -61,12 +63,6 @@ Ranked by geometric mean latency across all seven benchmark cases (lower is bett
 
 ```bash
 uv sync
-
-# Configure Modal credentials
-uv run modal token set --token-id <token-id> --token-secret <token-secret>
-
-# Deploy the H100 evaluator (once, before any agent runs)
-uv run modal deploy eval_modal_trimul.py
 ```
 
 Create a `.env` file in the repo root:
@@ -78,54 +74,80 @@ MODAL_TOKEN_SECRET=...
 AUTORESEARCH_MODEL=claude-sonnet-4-6   # optional, this is the default
 ```
 
+Deploy the H100 evaluator (once, before any agent runs):
+
+```bash
+uv run modal deploy eval_modal_trimul.py
+```
+
 ## Running the agent
 
+Two epochs of 10 iterations each, starting from scratch:
+
 ```bash
-bash run_agent.sh
+uv run trimul/agent.py --epoch-sizes 10 10
 ```
 
-Or directly:
+Start from the provided PyTorch baseline:
 
 ```bash
-uv run trimul/agent.py --baseline trimul/starting_point.py --iterations 25
+uv run trimul/agent.py --baseline trimul/starting_point.py --epoch-sizes 15 10
 ```
 
-Start from a specific baseline file instead of the current `submission.py`:
+Use different models for advisor and worker:
 
 ```bash
-uv run trimul/agent.py --baseline path/to/baseline.py --iterations 20
+uv run trimul/agent.py --baseline trimul/starting_point.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6 --epoch-sizes 15 10
+```
+
+Or use the provided script (checks for H100 then launches in tmux):
+
+```bash
+./run_agent.sh
 ```
 
 Quick correctness check without a full benchmark:
 
 ```bash
 cd trimul
-uv run python run_eval.py submission.py -o results.json --mode test
+python run_eval.py submission.py -o results.json --mode test
 ```
+
+## Epoch refresh
+
+Each epoch runs for `N` iterations, then:
+
+1. The epoch directory (history, TSV, plots, snapshots) is committed to git.
+2. All run artifacts are deleted — the next epoch's agents start with a blank slate.
+3. `best_submission.py` from the epoch is copied to `submission.py` as the next epoch's baseline.
+4. Advisor and worker agents are rebuilt with fresh memory and new thread IDs.
+
+Epoch directories are named by timestamp (not by epoch number) so agents cannot infer their position in the run from the filesystem.
 
 ## Structure
 
 ```
 eval_modal_trimul.py   — deployable Modal H100 evaluator
+run_agent.sh           — H100 check + tmux agent launcher
 trimul/
-├── agent.py           — advisor-worker agentic loop (LangChain + DeepAgents)
+├── agent.py           — advisor-worker agentic loop with epoch refresh
 ├── advisor_prompt.md  — advisor system prompt: strategy, comparison discipline
-├── worker_prompt.md   — worker system prompt: task spec, mandatory sequence, rules
+├── worker_prompt.md   — worker system prompt: mandatory sequence, rules
 ├── submission.py      — the kernel file the worker edits each iteration
 ├── starting_point.py  — baseline PyTorch TriMul kernel to seed each run
 ├── run_eval.py        — submits submission.py to the deployed Modal evaluator
 ├── tools.py           — log_experiment and get_experiment_history tools
-└── runs/              — one directory per run: history, TSV log, plots, best submission
+└── runs/              — one directory per run, containing one directory per epoch
 ```
 
-Each run directory contains:
-- `experiment_history.md` — full log of every attempt with code and result
-- `results.tsv` — tab-separated summary for plotting
-- `progress.png` — latency scatter plot updated each experiment; shows keep/discard/crash points, best-time step line, and cumulative LLM call count
-- `iterations.png` — best latency per advisor iteration
-- `best_submission.py` — snapshot of the fastest kernel found so far
-- `proposals.md` — advisor proposals for every iteration
-- `snapshot_iter{N}.py` — per-iteration snapshot of submission.py before the worker edits it
+Each epoch directory (named by timestamp) contains:
+- `experiment_history.md` — full log of every attempt with code and result (deleted after epoch commit)
+- `results.tsv` — tab-separated summary for plotting (deleted after epoch commit)
+- `progress.png` — latency scatter plot updated each experiment; shows keep/discard/crash points, best-time step line, and cumulative LLM call count (deleted after epoch commit)
+- `iterations.png` — best latency per advisor iteration (deleted after epoch commit)
+- `best_submission.py` — snapshot of the fastest kernel found in this epoch (kept; promoted to next epoch baseline)
+- `proposals.md` — advisor proposals for every iteration (deleted after epoch commit)
+- `snapshot_iter{N}.py` — per-iteration snapshots of submission.py before worker edits (deleted after epoch commit)
 
 ## LLM Call Counter
 

@@ -1,5 +1,5 @@
 """
-Advisor-Worker agentic loop for TriMul kernel optimization.
+Advisor-Worker agentic loop for TriMul kernel optimization with epoch refresh.
 
 Architecture:
   Advisor — reviews experiment history, decides direction, outputs a proposal.
@@ -7,20 +7,24 @@ Architecture:
   Worker  — receives the proposal, edits submission.py, evaluates, logs.
              Tools: log_experiment, get_experiment_history + shell.
 
-Both agents run via deepagents LocalShellBackend for shell access.
+The run is split into epochs. At the end of each epoch the experiment history
+is committed to git and cleared; the next epoch starts with fresh context,
+seeded from the previous epoch's best kernel.
 
 Usage:
     uv run trimul/agent.py
-    uv run trimul/agent.py --iterations 20 --baseline trimul/starting_point.py
+    uv run trimul/agent.py --epoch-sizes 15 10 --baseline trimul/starting_point.py
     uv run trimul/agent.py --advisor-model claude-opus-4-8 --worker-model claude-sonnet-4-6
 """
 
 import argparse
+import glob
 import json
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -229,8 +233,8 @@ def read_results_summary() -> str:
     return summary
 
 
-def save_proposals(run_dir: str, proposals: list) -> None:
-    with open(os.path.join(run_dir, "proposals.md"), "w") as f:
+def save_proposals(dir_: str, proposals: list) -> None:
+    with open(os.path.join(dir_, "proposals.md"), "w") as f:
         f.write("# Advisor Proposals\n\n")
         for iteration, proposal in proposals:
             f.write(f"---\n\n## Iteration {iteration}\n\n{proposal}\n\n")
@@ -253,12 +257,15 @@ def print_checkpoint(iteration: int, total: int, start_time: float, llm_call_cou
     print(f"{'#'*60}\n")
 
 
-def print_final_report(total_iterations: int, actual_iterations: int, start_time: float, llm_call_count: int = 0):
+def print_final_report(total_epochs: int, epoch_sizes: list[int], actual_iterations: int, start_time: float, llm_call_count: int = 0):
     elapsed_min = (time.time() - start_time) / 60
     print(f"\n{'='*60}\n  FINAL REPORT\n{'='*60}")
-    print(f"  Iterations: {actual_iterations}/{total_iterations} | Time: {elapsed_min:.1f} min")
+    print(f"  Epochs: {total_epochs} | Sizes: {epoch_sizes} | Total iterations: {actual_iterations}/{sum(epoch_sizes)}")
+    print(f"  Time: {elapsed_min:.1f} min")
     print(f"  LLM calls (total): {llm_call_count}")
-    print(read_results_summary())
+    summary = read_results_summary()
+    if summary != "No experiments run yet.":
+        print(summary)
     try:
         _update_plot()
     except Exception:
@@ -266,9 +273,88 @@ def print_final_report(total_iterations: int, actual_iterations: int, start_time
     print(f"{'='*60}")
 
 
+def _ensure_git_repo(repo_root: str) -> None:
+    """Initialize git repo if missing."""
+    if os.path.isdir(os.path.join(repo_root, ".git")):
+        return
+    subprocess.run(["git", "-C", repo_root, "init"], check=True)
+    subprocess.run(["git", "-C", repo_root, "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", repo_root, "commit", "-m", "init: seed repo with source files"],
+        check=True,
+    )
+    print("  [git] Initialized repository and created initial commit.", flush=True)
+
+
+def _commit_and_clear_epoch(repo_root: str, epoch_dir: str, epoch: int, run_name: str) -> None:
+    """Git-add + commit epoch_dir, then delete all run artifacts. best_submission.py is preserved."""
+    try:
+        subprocess.run(["git", "-C", repo_root, "add", epoch_dir], check=True)
+        subprocess.run(
+            ["git", "-C", repo_root, "commit", "-m", f"epoch {epoch}: {run_name}"],
+            check=True,
+        )
+        print(f"  [epoch {epoch}] Committed epoch dir to git.", flush=True)
+    except subprocess.CalledProcessError as e:
+        print(f"  [epoch {epoch}] Git commit failed: {e}", flush=True)
+
+    to_delete = [
+        os.path.join(epoch_dir, "experiment_history.md"),
+        os.path.join(epoch_dir, "results.tsv"),
+        os.path.join(epoch_dir, "progress.png"),
+        os.path.join(epoch_dir, "iterations.png"),
+        os.path.join(epoch_dir, "proposals.md"),
+    ]
+    to_delete += glob.glob(os.path.join(epoch_dir, "snapshot_iter*.py"))
+
+    for path in to_delete:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    print(f"  [epoch {epoch}] Cleared epoch artifacts (best_submission.py preserved).", flush=True)
+
+
+def _benchmark_baseline(epoch_baseline_name: str) -> tuple[str, float]:
+    """Benchmark the current submission.py as the epoch baseline. Returns (kickoff_note, time_us)."""
+    venv_python = os.path.join(REPO_ROOT, ".venv", "bin", "python")
+    print(f"Benchmarking baseline '{epoch_baseline_name}'...", flush=True)
+    ret = os.system(f"cd {PROJECT_DIR} && {venv_python} run_eval.py submission.py -o results.json 2>&1")
+    try:
+        with open(SUBMISSION_FILE) as f:
+            baseline_code = f.read()
+        with open(RESULTS_FILE) as f:
+            md = json.load(f)
+        m = re.search(r"Geometric mean: ⏱ ([\d.]+)", md if isinstance(md, str) else "")
+        time_us = float(m.group(1)) if m else 0.0
+        status = "keep" if (ret == 0 and time_us > 0) else "crash"
+        _log_experiment_direct(
+            kernel_code=baseline_code,
+            hypothesis=f"Baseline '{epoch_baseline_name}' — initial benchmark",
+            time_us=time_us,
+            status=status,
+            error_message="" if status == "keep" else f"run_eval exited {ret}",
+        )
+        print(f"Baseline logged: {time_us:.1f} µs ({status})", flush=True)
+        kickoff_note = (
+            f"The '{epoch_baseline_name}' baseline is already benchmarked and logged as experiment #1 "
+            f"({time_us:.1f} µs). Your job is to beat it. "
+            if status == "keep" else
+            f"The '{epoch_baseline_name}' baseline CRASHED (logged as experiment #1). "
+            "Read the crash error in get_experiment_history and fix the kernel. "
+        )
+        return kickoff_note, time_us
+    except Exception as e:
+        print(f"Warning: could not log baseline: {e}", flush=True)
+        return f"submission.py has been pre-loaded with '{epoch_baseline_name}'. Benchmark it first, then improve. ", 0.0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Advisor-Worker TriMul Optimization Agent")
-    parser.add_argument("--iterations", "-n", type=int, default=20)
+    parser = argparse.ArgumentParser(description="Advisor-Worker TriMul Optimization Agent (epoch refresh)")
+    parser.add_argument("--epoch-sizes", "-e", type=int, nargs="+", default=[10, 10],
+                        help="Number of worker iterations per epoch (e.g. --epoch-sizes 15 10)")
     parser.add_argument("--checkpoint-every", "-c", type=int, default=5)
     parser.add_argument("--baseline", "-b", default=None, help="Path to a baseline file to start from")
     parser.add_argument("--advisor-model", default=None)
@@ -294,31 +380,22 @@ def main():
             print(f"Error: baseline not found: {baseline_path}"); sys.exit(1)
         baseline_name = os.path.splitext(os.path.basename(baseline_path))[0]
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(PROJECT_DIR, "runs", f"{timestamp}_trimul_{baseline_name}")
-    os.makedirs(run_dir, exist_ok=True)
-    set_run_directory(run_dir)
+    epoch_sizes = args.epoch_sizes
+    n_epochs = len(epoch_sizes)
 
-    if baseline_path:
-        shutil.copy2(baseline_path, SUBMISSION_FILE)
-        print(f"Copied baseline '{baseline_name}' -> submission.py", flush=True)
-    else:
-        print("No baseline — using current submission.py.", flush=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_name = f"{timestamp}_trimul_{baseline_name}"
+    run_dir = os.path.join(PROJECT_DIR, "runs", run_name)
+    os.makedirs(run_dir, exist_ok=True)
 
     env = make_env()
-    advisor_agent, _ = build_advisor(advisor_model, env)
-    worker_agent, _ = build_worker(worker_model, env)
 
-    timestamp_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    advisor_config = {"configurable": {"thread_id": f"advisor-trimul-{baseline_name}-{timestamp_id}"}}
-    worker_config = {"configurable": {"thread_id": f"worker-trimul-{baseline_name}-{timestamp_id}"}}
-
-    print(f"Starting advisor-worker optimization loop")
+    print(f"Starting advisor-worker optimization loop (epoch refresh)")
     print(f"  Advisor model:  {advisor_model}")
     print(f"  Worker model:   {worker_model}")
     print(f"  Baseline:       {baseline_name}")
     print(f"  Run dir:        {run_dir}")
-    print(f"  Iterations:     {args.iterations}")
+    print(f"  Epochs:         {n_epochs} × {epoch_sizes}")
     print()
 
     def _sigterm_handler(signum, frame):
@@ -326,130 +403,164 @@ def main():
         sys.exit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
+    _ensure_git_repo(REPO_ROOT)
+
     start_time = time.time()
-
-    # Benchmark baseline before the loop
-    if baseline_path:
-        venv_python = os.path.join(REPO_ROOT, ".venv", "bin", "python")
-        print(f"Benchmarking baseline '{baseline_name}'...", flush=True)
-        ret = os.system(f"cd {PROJECT_DIR} && {venv_python} run_eval.py submission.py -o results.json 2>&1")
-        try:
-            with open(SUBMISSION_FILE) as f:
-                baseline_code = f.read()
-            with open(RESULTS_FILE) as f:
-                md = json.load(f)
-            m = re.search(r"Geometric mean: ⏱ ([\d.]+)", md if isinstance(md, str) else "")
-            time_us = float(m.group(1)) if m else 0.0
-            status = "keep" if (ret == 0 and time_us > 0) else "crash"
-            _log_experiment_direct(
-                kernel_code=baseline_code,
-                hypothesis=f"Baseline '{baseline_name}' — initial benchmark",
-                time_us=time_us,
-                status=status,
-                error_message="" if status == "keep" else f"run_eval exited {ret}",
-            )
-            print(f"Baseline logged: {time_us:.1f} µs ({status})", flush=True)
-            kickoff_note = (
-                f"The '{baseline_name}' baseline is already benchmarked and logged as experiment #1 "
-                f"({time_us:.1f} µs). Your job is to beat it. "
-                if status == "keep" else
-                f"The '{baseline_name}' baseline CRASHED (logged as experiment #1). "
-                "Read the crash error in get_experiment_history and fix the kernel. "
-            )
-        except Exception as e:
-            print(f"Warning: could not log baseline: {e}", flush=True)
-            kickoff_note = f"submission.py has been pre-loaded with '{baseline_name}'. Benchmark it first, then improve. "
-    else:
-        kickoff_note = "submission.py is the current kernel. Benchmark it first, then improve. "
-
-    all_proposals: list = []
+    prev_best: str | None = None
     total_llm_calls = 0
-    iteration = 0
+    total_iterations = 0
+
     try:
-        while iteration < args.iterations:
-            iteration += 1
-            set_agent_iteration(iteration)
+        for epoch in range(1, n_epochs + 1):
+            refresh_every = epoch_sizes[epoch - 1]
+            epoch_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            epoch_dir = os.path.join(run_dir, epoch_ts)
+            os.makedirs(epoch_dir, exist_ok=True)
+            set_run_directory(epoch_dir)
+
             print(f"\n{'='*60}")
-            print(f"  ITERATION {iteration}/{args.iterations}")
+            print(f"  EPOCH {epoch}/{n_epochs} — {refresh_every} iterations")
             print(f"{'='*60}\n", flush=True)
 
-            summary = read_results_summary()
-
-            # ── ADVISOR ──────────────────────────────────────────────────
-            print("[advisor] Proposing...", flush=True)
-            advisor_message = (
-                f"Iteration {iteration}/{args.iterations}.\n\n"
-                f"{summary}\n\n"
-                "Call get_experiment_history for the full code and results, "
-                "then output your structured proposal."
-            )
-            proposal, advisor_calls = stream_agent_retrying(advisor_agent, advisor_config, advisor_message, label="advisor")
-            total_llm_calls += advisor_calls
-            set_llm_call_count(total_llm_calls)
-            all_proposals.append((iteration, proposal))
-            print(f"\n[advisor proposal]\n{'-'*40}\n{proposal[:1000]}\n{'-'*40}\n", flush=True)
-            save_proposals(run_dir, all_proposals)
-
-            # ── WORKER ───────────────────────────────────────────────────
-            print("[worker] Implementing...", flush=True)
-            log_count_before = _get_next_iteration() - 1
-
-            snapshot_path = os.path.join(run_dir, f"snapshot_iter{iteration}.py")
-            if os.path.exists(SUBMISSION_FILE):
-                shutil.copy2(SUBMISSION_FILE, snapshot_path)
-
-            worker_message = (
-                f"Iteration {iteration}/{args.iterations}.\n\n"
-                f"## Advisor Proposal\n\n{proposal}\n\n"
-                f"## Your Task\n\n"
-                f"{kickoff_note}"
-                "Implement the advisor's proposal: read submission.py, make ONE targeted change, "
-                "evaluate it with `python run_eval.py submission.py -o results.json`, "
-                "then call log_experiment and stop.\n\n"
-                f"{summary}"
-            )
-            kickoff_note = ""  # only shown on first iteration
-
-            _, worker_calls = stream_agent_retrying(worker_agent, worker_config, worker_message, label="worker")
-            total_llm_calls += worker_calls
-            set_llm_call_count(total_llm_calls)
-
-            log_count_after = _get_next_iteration() - 1
-            if log_count_after <= log_count_before:
-                print("[WARNING] Worker did not call log_experiment — restoring submission.py from snapshot.", flush=True)
-                if os.path.exists(snapshot_path):
-                    shutil.copy2(snapshot_path, SUBMISSION_FILE)
+            # Set baseline for this epoch
+            if epoch == 1:
+                if baseline_path:
+                    shutil.copy2(baseline_path, SUBMISSION_FILE)
+                    print(f"Copied baseline '{baseline_name}' -> submission.py", flush=True)
+                else:
+                    print("No baseline — using current submission.py.", flush=True)
+                epoch_baseline_name = baseline_name
             else:
-                # Restore from best on crash
-                rows = []
-                if os.path.exists(_tools.TSV_FILE):
-                    with open(_tools.TSV_FILE) as f:
-                        lines = f.readlines()
-                    for line in lines[1:]:
-                        parts = line.strip().split("\t")
-                        if len(parts) >= 5:
-                            rows.append({
-                                "status": parts[4],
-                                "time_us": float(parts[3]) if parts[3].replace(".", "").isdigit() else 0.0,
-                            })
-                if rows and rows[-1]["status"] == "crash":
-                    best_path = os.path.join(run_dir, "best_submission.py")
-                    restore_src = best_path if os.path.exists(best_path) else snapshot_path
-                    if os.path.exists(restore_src):
-                        shutil.copy2(restore_src, SUBMISSION_FILE)
-                        print(f"  [crash restore] submission.py restored from {os.path.basename(restore_src)}", flush=True)
+                if prev_best and os.path.exists(prev_best):
+                    shutil.copy2(prev_best, SUBMISSION_FILE)
+                    print(f"Promoted previous best -> submission.py", flush=True)
+                else:
+                    print("Warning: no previous best found — using current submission.py.", flush=True)
+                epoch_baseline_name = "previous_best"
 
-            if iteration % args.checkpoint_every == 0:
-                print_checkpoint(iteration, args.iterations, start_time, total_llm_calls)
+            # Fresh agents per epoch (new MemorySaver, new thread IDs)
+            advisor_agent, _ = build_advisor(advisor_model, env)
+            worker_agent, _ = build_worker(worker_model, env)
+            advisor_config = {"configurable": {"thread_id": f"advisor-trimul-{baseline_name}-{epoch_ts}"}}
+            worker_config = {"configurable": {"thread_id": f"worker-trimul-{baseline_name}-{epoch_ts}"}}
+
+            kickoff_note, _ = _benchmark_baseline(epoch_baseline_name)
+
+            epoch_proposals: list = []
+            epoch_start_time = time.time()
+            iteration = 0
+
+            try:
+                while iteration < refresh_every:
+                    iteration += 1
+                    total_iterations += 1
+                    set_agent_iteration(total_iterations)
+                    print(f"\n{'='*60}")
+                    print(f"  EPOCH {epoch}/{n_epochs} | ITERATION {iteration}/{refresh_every}")
+                    print(f"{'='*60}\n", flush=True)
+
+                    summary = read_results_summary()
+
+                    # ── ADVISOR ──────────────────────────────────────────────────
+                    print("[advisor] Proposing...", flush=True)
+                    advisor_message = (
+                        f"Epoch {epoch}/{n_epochs}, iteration {iteration}/{refresh_every}.\n\n"
+                        f"{summary}\n\n"
+                        "Call get_experiment_history for the full code and results, "
+                        "then output your structured proposal."
+                    )
+                    proposal, advisor_calls = stream_agent_retrying(advisor_agent, advisor_config, advisor_message, label="advisor")
+                    total_llm_calls += advisor_calls
+                    set_llm_call_count(total_llm_calls)
+                    epoch_proposals.append((iteration, proposal))
+                    print(f"\n[advisor proposal]\n{'-'*40}\n{proposal[:1000]}\n{'-'*40}\n", flush=True)
+                    save_proposals(epoch_dir, epoch_proposals)
+
+                    # ── WORKER ───────────────────────────────────────────────────
+                    print("[worker] Implementing...", flush=True)
+                    log_count_before = _get_next_iteration() - 1
+
+                    snapshot_path = os.path.join(epoch_dir, f"snapshot_iter{iteration}.py")
+                    if os.path.exists(SUBMISSION_FILE):
+                        shutil.copy2(SUBMISSION_FILE, snapshot_path)
+
+                    worker_message = (
+                        f"Epoch {epoch}/{n_epochs}, iteration {iteration}/{refresh_every}.\n\n"
+                        f"## Advisor Proposal\n\n{proposal}\n\n"
+                        f"## Your Task\n\n"
+                        f"{kickoff_note}"
+                        "Implement the advisor's proposal: read submission.py, make ONE targeted change, "
+                        "evaluate it with `python run_eval.py submission.py -o results.json`, "
+                        "then call log_experiment and stop.\n\n"
+                        f"{summary}"
+                    )
+                    kickoff_note = ""  # only shown on first iteration of each epoch
+
+                    _, worker_calls = stream_agent_retrying(worker_agent, worker_config, worker_message, label="worker")
+                    total_llm_calls += worker_calls
+                    set_llm_call_count(total_llm_calls)
+
+                    log_count_after = _get_next_iteration() - 1
+                    if log_count_after <= log_count_before:
+                        print("[WARNING] Worker did not call log_experiment — restoring submission.py from snapshot.", flush=True)
+                        if os.path.exists(snapshot_path):
+                            shutil.copy2(snapshot_path, SUBMISSION_FILE)
+                    else:
+                        # Restore from best on crash
+                        rows = []
+                        if os.path.exists(_tools.TSV_FILE):
+                            with open(_tools.TSV_FILE) as f:
+                                lines = f.readlines()
+                            for line in lines[1:]:
+                                parts = line.strip().split("\t")
+                                if len(parts) >= 5:
+                                    rows.append({
+                                        "status": parts[4],
+                                        "time_us": float(parts[3]) if parts[3].replace(".", "").isdigit() else 0.0,
+                                    })
+                        if rows and rows[-1]["status"] == "crash":
+                            best_path = os.path.join(epoch_dir, "best_submission.py")
+                            restore_src = best_path if os.path.exists(best_path) else snapshot_path
+                            if os.path.exists(restore_src):
+                                shutil.copy2(restore_src, SUBMISSION_FILE)
+                                print(f"  [crash restore] submission.py restored from {os.path.basename(restore_src)}", flush=True)
+
+                    if iteration % args.checkpoint_every == 0:
+                        print_checkpoint(iteration, refresh_every, epoch_start_time, total_llm_calls)
+
+            except KeyboardInterrupt:
+                save_proposals(epoch_dir, epoch_proposals)
+                raise
+
+            save_proposals(epoch_dir, epoch_proposals)
+
+            # Print epoch summary before clearing artifacts
+            print(f"\n{'#'*60}")
+            print(f"  EPOCH {epoch}/{n_epochs} COMPLETE")
+            print(f"  Iterations: {iteration} | Elapsed: {(time.time() - epoch_start_time) / 60:.1f} min")
+            print(f"  LLM calls (total): {total_llm_calls}")
+            print(f"{'#'*60}")
+            print(read_results_summary())
+            print(f"{'#'*60}\n")
+
+            # Track best kernel for next epoch
+            best_path = os.path.join(epoch_dir, "best_submission.py")
+            if os.path.exists(best_path):
+                prev_best = best_path
+            elif os.path.exists(SUBMISSION_FILE):
+                fallback = os.path.join(epoch_dir, "best_submission.py")
+                shutil.copy2(SUBMISSION_FILE, fallback)
+                prev_best = fallback
+
+            _commit_and_clear_epoch(REPO_ROOT, epoch_dir, epoch, run_name)
 
     except KeyboardInterrupt:
-        print(f"\n--- Interrupted at iteration {iteration} ---")
+        print(f"\n--- Interrupted at total iteration {total_iterations} ---")
     except Exception as e:
-        print(f"\n--- Error at iteration {iteration}: {e} ---")
+        print(f"\n--- Error at total iteration {total_iterations}: {e} ---")
         import traceback; traceback.print_exc()
     finally:
-        save_proposals(run_dir, all_proposals)
-        print_final_report(args.iterations, iteration, start_time, total_llm_calls)
+        print_final_report(n_epochs, epoch_sizes, total_iterations, start_time, total_llm_calls)
 
 
 if __name__ == "__main__":
