@@ -1,0 +1,17 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	0	HEAD	11010.26	keep	Baseline 'starting_point' — initial benchmark
+2	1	HEAD	10349.94	keep	Advisor proposal: eliminate nn.Module reconstruction overhead, fuse all 5 projections into a single 
+3	2	HEAD	7070.93	keep	Advisor proposal: use bf16 for the bmm contraction to enable H100 tensor cores, enable TF32 for proj
+4	3	HEAD	0.00	crash	Advisor proposal: cache fused weight matrix (torch.cat of 5 weight matrices) keyed by data_ptr+shape
+5	4	HEAD	0.00	crash	Advisor proposal: retry weight caching using id(lp_w) as cache key (Python object identity) instead 
+6	5	HEAD	6095.95	keep	Advisor proposal: wrap core computation in torch.compile(mode='reduce-overhead', fullgraph=True). Ex
+7	6	HEAD	13490.71	discard	Advisor proposal: switch from reduce-overhead to max-autotune, move LayerNorm inside compiled region
+8	7	HEAD	7693.57	discard	Advisor proposal: restore reduce-overhead, move LayerNorm inside compiled region, derive B/N/H from 
+9	8	HEAD	7473.20	discard	Advisor proposal: replace permute+bmm+permute contraction with torch.einsum('bikh,bjkh->bijh') on 4D
+10	9	HEAD	35733.22	discard	Custom Triton kernel for TriMul contraction: grid (B * cdiv(N,32)^2, H) with each program computing 
+11	10	HEAD	6234.40	discard	Redesigned Triton contraction kernel: grid (B*H, cdiv(N,BLOCK_N), cdiv(N,BLOCK_N)), each program han
+12	11	HEAD	22188.10	discard	Eliminate permute copies by reading [B,N,N,H] layout directly in Triton kernel with native strides (
+13	12	HEAD	0.00	crash	Advisor proposal: add dynamic=True to torch.compile(reduce-overhead, fullgraph=True) to get a single
+14	13	HEAD	6814.14	discard	Advisor proposal: run fused-5H projection GEMM in bf16 (x_flat.to(bf16) @ fused_w.to(bf16).t()) for 
+15	14	HEAD	7261.37	discard	Advisor proposal: remove B/N/H Python int args from _trimul_inner, derive them from tensor shapes in
+16	15	HEAD	0.00	crash	Epoch 1 final: fused Triton kernel replacing sigmoid+multiply+mask+reshape+permute+bf16cast for left
