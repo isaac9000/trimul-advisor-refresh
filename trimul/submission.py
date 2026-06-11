@@ -63,49 +63,20 @@ class TriMul(nn.Module):
 
 
 def custom_kernel(data):
-    import torch.nn.functional as F
-
     input_tensor, mask, weights, config = data
-    hidden_dim = config['hidden_dim']
+    trimul = TriMul(config["dim"], config["hidden_dim"]).to(input_tensor.device)
 
-    # Fuse all 5 projections into one GEMM
-    fused_w = torch.cat([
-        weights['left_proj.weight'],
-        weights['right_proj.weight'],
-        weights['left_gate.weight'],
-        weights['right_gate.weight'],
-        weights['out_gate.weight'],
-    ], dim=0)
+    trimul.norm.weight = nn.Parameter(weights['norm.weight'].to(torch.float32))
+    trimul.left_proj.weight = nn.Parameter(weights['left_proj.weight'].to(torch.float32))
+    trimul.right_proj.weight = nn.Parameter(weights['right_proj.weight'].to(torch.float32))
+    trimul.left_gate.weight = nn.Parameter(weights['left_gate.weight'].to(torch.float32))
+    trimul.right_gate.weight = nn.Parameter(weights['right_gate.weight'].to(torch.float32))
+    trimul.out_gate.weight = nn.Parameter(weights['out_gate.weight'].to(torch.float32))
+    trimul.to_out_norm.weight = nn.Parameter(weights['to_out_norm.weight'].to(torch.float32))
+    trimul.to_out.weight = nn.Parameter(weights['to_out.weight'].to(torch.float32))
+    trimul.norm.bias = nn.Parameter(weights['norm.bias'].to(torch.float32))
+    trimul.to_out_norm.bias = nn.Parameter(weights['to_out_norm.bias'].to(torch.float32))
 
-    # LayerNorm input (float32)
-    x = F.layer_norm(input_tensor, [input_tensor.shape[-1]],
-                     weights['norm.weight'], weights['norm.bias'])
+    output = trimul(input_tensor, mask).to(torch.float32)
 
-    # Single fused GEMM: (B, N, N, 5*H)
-    proj_all = F.linear(x, fused_w)
-
-    left_proj  = proj_all[..., :hidden_dim]
-    right_proj = proj_all[..., hidden_dim:2*hidden_dim]
-    left_gate  = proj_all[..., 2*hidden_dim:3*hidden_dim].sigmoid()
-    right_gate = proj_all[..., 3*hidden_dim:4*hidden_dim].sigmoid()
-    out_gate   = proj_all[..., 4*hidden_dim:5*hidden_dim].sigmoid()
-
-    # Apply mask and gates (float32)
-    mask_u = mask.unsqueeze(-1)
-    left  = left_proj  * left_gate  * mask_u   # (B, N, N, H)
-    right = right_proj * right_gate * mask_u   # (B, N, N, H)
-
-    # Einsum: b i k h, b j k h -> b i j h  (contraction over k)
-    # Use fp16 inputs for tensor core throughput; force fp32 accumulation
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    bs, seqlen, _, H = left.shape
-    left_bh  = left.half().permute(0, 3, 1, 2).reshape(bs * H, seqlen, seqlen)
-    right_bh = right.half().permute(0, 3, 1, 2).reshape(bs * H, seqlen, seqlen)
-    out_bh = torch.bmm(left_bh, right_bh.transpose(-1, -2))  # fp16 in, fp32 acc
-    out = out_bh.float().reshape(bs, H, seqlen, seqlen).permute(0, 2, 3, 1)
-
-    # LayerNorm + out_gate + final projection (float32 throughout)
-    out = F.layer_norm(out, [hidden_dim],
-                       weights['to_out_norm.weight'], weights['to_out_norm.bias'])
-    out = out * out_gate
-    return F.linear(out, weights['to_out.weight'])
+    return output

@@ -289,7 +289,7 @@ def _ensure_git_repo(repo_root: str) -> None:
 def _commit_and_clear_epoch(repo_root: str, epoch_dir: str, epoch: int, run_name: str) -> None:
     """Git-add + commit epoch_dir, then delete all run artifacts. best_submission.py is preserved."""
     try:
-        subprocess.run(["git", "-C", repo_root, "add", epoch_dir], check=True)
+        subprocess.run(["git", "-C", repo_root, "add", "-f", epoch_dir], check=True)
         subprocess.run(
             ["git", "-C", repo_root, "commit", "-m", f"epoch {epoch}: {run_name}"],
             check=True,
