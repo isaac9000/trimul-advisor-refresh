@@ -1,0 +1,12 @@
+experiment	agent_iteration	commit	time_us	status	description
+1	15	HEAD	6555.38	keep	Baseline 'previous_best' — initial benchmark
+2	16	HEAD	12154.78	discard	Advisor proposed replacing the bmm contraction with a Triton kernel tiling over (b*h, i_tile, j_tile
+3	17	HEAD	6250.77	keep	Advisor proposed caching the fused weight matrix to avoid torch.cat allocation on every call. Implem
+4	18	HEAD	6493.02	discard	Advisor proposed casting left/right to bf16 BEFORE the permute (instead of after) to halve the memor
+5	19	HEAD	6667.73	discard	Advisor proposed replacing manual permute+bmm contraction with torch.einsum('bikh,bjkh->bijh', left_
+6	20	HEAD	36043.76	discard	Advisor proposed a Triton kernel that tiles over (B*N*N) output positions, processes all H=128 chann
+7	21	HEAD	6187.29	keep	Advisor proposed Direction A (full bf16 pipeline) but bf16 projection GEMMs caused correctness failu
+8	22	HEAD	7495.09	discard	Advisor proposed: (1) move input LayerNorm inside _trimul_inner so it's part of the CUDA graph, (2) 
+9	23	HEAD	6296.05	discard	Advisor proposed capturing weight tensors as closure constants in the compiled function, so only (x,
+10	24	HEAD	5754.16	keep	Advisor proposed explicit CUDA graphs per shape. Attempted to implement torch.cuda.CUDAGraph with st
+11	25	HEAD	13144.36	discard	Final iteration. Advisor's last suggestion: try torch.compile(mode='max-autotune') instead of 'reduc
