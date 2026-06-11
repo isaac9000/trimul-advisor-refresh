@@ -18,7 +18,6 @@ Usage:
 """
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -277,44 +276,50 @@ def _ensure_git_repo(repo_root: str) -> None:
     """Initialize git repo if missing."""
     if os.path.isdir(os.path.join(repo_root, ".git")):
         return
-    subprocess.run(["git", "-C", repo_root, "init"], check=True)
-    subprocess.run(["git", "-C", repo_root, "add", "-A"], check=True)
-    subprocess.run(
-        ["git", "-C", repo_root, "commit", "-m", "init: seed repo with source files"],
-        check=True,
-    )
+    subprocess.run(["git", "init"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "agent@trimul-refresh"],
+                   cwd=repo_root, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TriMul Refresh Agent"],
+                   cwd=repo_root, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo_root, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init: seed repo with source files"],
+                   cwd=repo_root, check=True, capture_output=True)
     print("  [git] Initialized repository and created initial commit.", flush=True)
 
 
 def _commit_and_clear_epoch(repo_root: str, epoch_dir: str, epoch: int, run_name: str) -> None:
     """Git-add + commit epoch_dir, then delete all run artifacts. best_submission.py is preserved."""
     try:
-        subprocess.run(["git", "-C", repo_root, "add", "-f", epoch_dir], check=True)
-        subprocess.run(
-            ["git", "-C", repo_root, "commit", "-m", f"epoch {epoch}: {run_name}"],
-            check=True,
+        subprocess.run(["git", "add", "-f", epoch_dir], cwd=repo_root, check=True, capture_output=True)
+        result = subprocess.run(
+            ["git", "commit", "-m", f"epoch {epoch}: {run_name}"],
+            cwd=repo_root, capture_output=True,
         )
-        print(f"  [epoch {epoch}] Committed epoch dir to git.", flush=True)
+        if result.returncode == 0:
+            print(f"  [epoch {epoch}] Committed epoch dir to git.", flush=True)
+        else:
+            stderr = result.stderr.decode()[:200]
+            print(f"  [epoch {epoch}] Git commit warning: {stderr}", flush=True)
     except subprocess.CalledProcessError as e:
-        print(f"  [epoch {epoch}] Git commit failed: {e}", flush=True)
+        print(f"  [epoch {epoch}] Git add failed: {e}", flush=True)
 
-    to_delete = [
-        os.path.join(epoch_dir, "experiment_history.md"),
-        os.path.join(epoch_dir, "results.tsv"),
-        os.path.join(epoch_dir, "progress.png"),
-        os.path.join(epoch_dir, "iterations.png"),
-        os.path.join(epoch_dir, "proposals.md"),
-    ]
-    to_delete += glob.glob(os.path.join(epoch_dir, "snapshot_iter*.py"))
+    delete_patterns = ["experiment_history.md", "results.tsv", "progress.png",
+                       "iterations.png", "proposals.md"]
+    deleted = []
+    for name in delete_patterns:
+        path = os.path.join(epoch_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+            deleted.append(name)
 
-    for path in to_delete:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
+    for fname in os.listdir(epoch_dir):
+        if fname.startswith("snapshot_iter") and fname.endswith(".py"):
+            os.remove(os.path.join(epoch_dir, fname))
+            deleted.append(fname)
 
-    print(f"  [epoch {epoch}] Cleared epoch artifacts (best_submission.py preserved).", flush=True)
+    if deleted:
+        print(f"  [epoch {epoch}] Cleared: {', '.join(deleted)}", flush=True)
+    print(f"  [epoch {epoch}] best_submission.py preserved.", flush=True)
 
 
 def _benchmark_baseline(epoch_baseline_name: str) -> tuple[str, float]:
