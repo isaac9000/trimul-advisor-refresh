@@ -325,6 +325,8 @@ def _commit_and_clear_epoch(repo_root: str, epoch_dir: str, epoch: int, run_name
 def _benchmark_baseline(epoch_baseline_name: str) -> tuple[str, float]:
     """Benchmark the current submission.py as the epoch baseline. Returns (kickoff_note, time_us)."""
     venv_python = os.path.join(REPO_ROOT, ".venv", "bin", "python")
+    if not os.path.exists(venv_python):
+        venv_python = shutil.which("python3") or sys.executable
     print(f"Benchmarking baseline '{epoch_baseline_name}'...", flush=True)
     ret = os.system(f"cd {PROJECT_DIR} && {venv_python} run_eval.py submission.py -o results.json 2>&1")
     try:

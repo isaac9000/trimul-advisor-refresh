@@ -51,7 +51,6 @@ BENCH_WALL_TIMEOUT_NS = 120e9
 BENCH_NO_GRAD = False
 BENCH_MAX_REPEATS = 100
 BENCH_MAX_TIME_NS = 10e9
-BENCH_WARMUP_STYLE = "tiny_benchmark"
 
 # ── Modal image ───────────────────────────────────────────────────────────────
 
